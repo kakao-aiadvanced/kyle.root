@@ -33,37 +33,47 @@ from langchain_core.prompts import ChatPromptTemplate
 
 # TODO github 올리기 전에 제거 필요
 os.environ['OPENAI_API_KEY'] = ""
-# LLM 생성 (Option#1 적용)
-#llm = ChatOpenAI(model="gpt-4o-mini", temperature = 0)
-llm = ChatOpenAI(
-    model="gpt-4o-mini",
-    model_kwargs={"response_format": {"type": "json_object"}},
-)
 
-llm_not_json = ChatOpenAI(model="gpt-4o-mini", temperature = 0)
+# 전역 변수 선언
+llm = None
+llm_not_json = None
+retriever = None
+docs = None
 
-# retriever 초기화
-urls = [
-    "https://lilianweng.github.io/posts/2023-06-23-agent/",
-    "https://lilianweng.github.io/posts/2023-03-15-prompt-engineering/",
-    "https://lilianweng.github.io/posts/2023-10-25-adv-attack-llm/",
-]
+def initialize_variables():
+    global llm, llm_not_json, retriever, docs  # 전역 변수를 사용하기 위해 global 키워드 사용
 
-docs = [WebBaseLoader(url).load() for url in urls]
-docs_list = [item for sublist in docs for item in sublist]
+    # LLM 생성 (Option#1 적용)
+    #llm = ChatOpenAI(model="gpt-4o-mini", temperature = 0)
+    llm = ChatOpenAI(
+        model="gpt-4o-mini",
+        model_kwargs={"response_format": {"type": "json_object"}},
+    )
 
-text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-    chunk_size=250, chunk_overlap=0
-)
-doc_splits = text_splitter.split_documents(docs_list)
+    llm_not_json = ChatOpenAI(model="gpt-4o-mini", temperature = 0)
 
-# Add to vectorDB
-vectorstore = Chroma.from_documents(
-    documents=doc_splits,
-    collection_name="rag-chroma",
-    embedding = OpenAIEmbeddings(model="text-embedding-3-small")
-)
-retriever = vectorstore.as_retriever()
+    # retriever 초기화
+    urls = [
+        "https://lilianweng.github.io/posts/2023-06-23-agent/",
+        "https://lilianweng.github.io/posts/2023-03-15-prompt-engineering/",
+        "https://lilianweng.github.io/posts/2023-10-25-adv-attack-llm/",
+    ]
+
+    docs = [WebBaseLoader(url).load() for url in urls]
+    docs_list = [item for sublist in docs for item in sublist]
+
+    text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+        chunk_size=250, chunk_overlap=0
+    )
+    doc_splits = text_splitter.split_documents(docs_list)
+
+    # Add to vectorDB
+    vectorstore = Chroma.from_documents(
+        documents=doc_splits,
+        collection_name="rag-chroma",
+        embedding = OpenAIEmbeddings(model="text-embedding-3-small")
+    )
+    retriever = vectorstore.as_retriever()
 
 
 ### State
@@ -82,6 +92,8 @@ class GraphState(TypedDict):
     generation: str
     web_search: str
     documents: List[str]
+    web_search_count: int
+    generation_count: int
 
 
 ### Nodes
@@ -102,7 +114,12 @@ def retrieve(state):
     documents = retriever.invoke(question)
     print(question)
     print(documents)
-    return {"documents": documents, "question": question}
+
+    # 추가된 State 들을 여기서 초기화 해줘야 함
+    return {"documents": documents, 
+            "question": question, 
+            "web_search_count":0, 
+            "generation_count":0}
 
 
 def generate(state):
@@ -135,8 +152,10 @@ def generate(state):
 
     # RAG generation
     generation = rag_chain.invoke({"context": documents, "question": question})
-    return {"documents": documents, "question": question, "generation": generation}
+    generation_count = state["generation_count"] + 1
+    return {"documents": documents, "question": question, "generation": generation, "generation_count": generation_count}
 
+# relevance check
 def grade_documents(state):
     """
     Determines whether the retrieved documents are relevant to the question
@@ -170,9 +189,12 @@ def grade_documents(state):
 
     retrieval_grader = prompt | llm | JsonOutputParser()
 
+    
+
     # Score each doc
     filtered_docs = []
     web_search = "No"
+    web_search_count = state["web_search_count"]
     for d in documents:
         score = retrieval_grader.invoke(
             {"question": question, "document": d.page_content}
@@ -180,15 +202,20 @@ def grade_documents(state):
         grade = score["score"]
         # Document relevant
         if grade.lower() == "yes":
+            print(f" count : {web_search_count}")
             print("---GRADE: DOCUMENT RELEVANT---")
             filtered_docs.append(d)
         # Document not relevant
         else:
-            print("---GRADE: DOCUMENT NOT RELEVANT---")
-            # We do not include the document in filtered_docs
-            # We set a flag to indicate that we want to run web search
-            web_search = "Yes"
-            continue
+            if web_search_count > 0:
+                pprint("failed:not relevant")
+                return "failed:not relevant"
+            else:
+                print("---GRADE: DOCUMENT NOT RELEVANT---")
+                # We do not include the document in filtered_docs
+                # We set a flag to indicate that we want to run web search
+                web_search = "Yes"
+                continue
     return {"documents": filtered_docs, "question": question, "web_search": web_search}
 
 
@@ -224,7 +251,10 @@ def web_search(state):
         documents.append(web_results)
     else:
         documents = [web_results]
-    return {"documents": documents, "question": question}
+
+    # 웹 검색 횟수 기록
+    web_search_count = state["web_search_count"] + 1
+    return {"documents": documents, "question": question, "web_search_count":web_search_count}
 
 
 ### Edges
@@ -299,6 +329,7 @@ def decide_to_generate(state):
         print(
             "---DECISION: ALL DOCUMENTS ARE NOT RELEVANT TO QUESTION, INCLUDE WEB SEARCH---"
         )
+
         return "websearch"
     else:
         # We have relevant documents, so generate answer
@@ -362,6 +393,7 @@ def grade_generation_v_documents_and_question(state):
 
     answer_grader = prompt | llm | JsonOutputParser()
 
+    generation_count = state["generation_count"]
     # Check hallucination
     if grade == "yes":
         print("---DECISION: GENERATION IS GROUNDED IN DOCUMENTS---")
@@ -376,8 +408,12 @@ def grade_generation_v_documents_and_question(state):
             print("---DECISION: GENERATION DOES NOT ADDRESS QUESTION---")
             return "not useful"
     else:
-        pprint("---DECISION: GENERATION IS NOT GROUNDED IN DOCUMENTS, RE-TRY---")
-        return "not supported"
+        if generation_count > 0:
+            pprint("---failed:hallucination---")
+            return "failed:hallucination"
+        else :
+            pprint("---DECISION: GENERATION IS NOT GROUNDED IN DOCUMENTS, RE-TRY---")
+            return "not supported"
 
 
 workflow = StateGraph(GraphState)
@@ -390,13 +426,14 @@ workflow.add_node("generate", generate)  # generatae
 
 
 # Build graph
-workflow.set_conditional_entry_point(
-    route_question,
-    {
-        "websearch": "websearch",
-        "vectorstore": "retrieve",
-    },
-)
+# workflow.set_conditional_entry_point(
+#     route_question,
+#     {
+#         "websearch": "websearch",
+#         "vectorstore": "retrieve",
+#     },
+# )
+workflow.set_entry_point("retrieve")
 
 workflow.add_edge("retrieve", "grade_documents")
 workflow.add_conditional_edges(
@@ -405,9 +442,10 @@ workflow.add_conditional_edges(
     {
         "websearch": "websearch",
         "generate": "generate",
+        "failed:not relevant": END,
     },
 )
-workflow.add_edge("websearch", "generate")
+workflow.add_edge("websearch", "grade_documents")
 workflow.add_conditional_edges(
     "generate",
     grade_generation_v_documents_and_question,
@@ -415,16 +453,21 @@ workflow.add_conditional_edges(
         "not supported": "generate",
         "useful": END,
         "not useful": "websearch",
+        "failed:hallucination": END,
     },
 )
 
+
+initialize_variables()
 
 # Compile
 app = workflow.compile()
 
 # Test
-inputs = {"question": "What is prompt?"}
+inputs = {"question": "미나어리ㅏㅁ니ㅓㅇ러 리마넝리마넝리 "}
 for output in app.stream(inputs):
     for key, value in output.items():
         pprint(f"Finished running: {key}:")
-pprint(value["generation"])
+
+if "generation" in value:
+    pprint(value["generation"])
